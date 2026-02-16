@@ -183,6 +183,47 @@ class PBLoss(nn.Module):
         self.register_buffer('mu', torch.stack(obs_centers))
         self.register_buffer('sigma', torch.stack(obs_sigmas))
 
+    def compute_per_sample_cost(self, traj_x, traj_u):
+        """
+        Calculates the scalar cost Psi(D) for EACH trajectory in the batch.
+        Returns shape: (Batch_Size,)
+        """
+        batch_size, horizon, _ = traj_x.shape
+
+        # --- 1. Target Tracking ---
+        # Error shape: (Batch, Horizon, State_Dim)
+        error = traj_x - self.x_target
+        # einsum -> bh: Result is (Batch, Horizon)
+        cost_target_t = torch.einsum('bhi,ij,bhj->bh', error, self.Q, error)
+
+        # --- 2. Control Effort ---
+        # einsum -> bh: Result is (Batch, Horizon)
+        cost_u_t = torch.einsum('bhi,ij,bhj->bh', traj_u, self.R, traj_u)
+
+        # --- 3. Obstacle Avoidance ---
+        x_reshaped = traj_x.view(batch_size, horizon, self.n_agents, self.state_per_agent)
+        pos = x_reshaped[..., :2]  # (Batch, Horizon, Agents, 2)
+
+        p = pos.unsqueeze(3)  # (Batch, Horizon, Agents, 1, 2)
+        m = self.mu.view(1, 1, 1, -1, 2)
+        s = self.sigma.view(1, 1, 1, -1, 2)
+
+        # Calculate Gaussian exponent
+        exponent = -0.5 * torch.sum(((p - m) ** 2) / (s ** 2 + 1e-6), dim=-1)
+        gaussian_density = torch.exp(exponent)
+
+        # Sum over Agents (dim 2) and Obstacles (dim 3) -> (Batch, Horizon)
+        cost_obs_t = self.alpha_obs * gaussian_density.sum(dim=(2, 3))
+
+        # --- 4. Aggregate over Time (Horizon) ---
+        # We sum (or mean) over the time dimension (dim=1) to get one scalar per trajectory.
+        # Using .mean(dim=1) keeps the scale consistent with your original loss.
+        # If you prefer cumulative cost, use .sum(dim=1).
+
+        per_sample_cost = (cost_target_t + cost_u_t + cost_obs_t).mean(dim=1)
+
+        return per_sample_cost  # Shape: (Batch_Size,)
+
     def forward(self, traj_x, traj_u):
         """
         traj_x: (Batch, Horizon, Total_State_Dim)
@@ -231,3 +272,44 @@ class PBLoss(nn.Module):
         total_loss = loss_target + loss_u + loss_obs
 
         return total_loss, loss_target.item(), loss_u.item(), loss_obs.item()
+
+# OPTION A: Pinball Loss (Targeting (1-alpha) Quantile)
+class PinballLossWrapper(nn.Module):
+    def __init__(self, alpha, metric):
+        super().__init__()
+        self.alpha = alpha
+        self.metric = metric
+        # Initialize tau (threshold) as a learnable parameter
+        self.tau = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, traj_x, traj_u):
+        # Ensure metric returns a VECTOR of performance scores [Batch_Size]: Tensor of scalar metrics Psi(D;K) for a batch of datasets.
+        performance_scores = self.metric.compute_per_sample_cost(traj_x, traj_u)
+
+        q = 1.0 - self.alpha
+        errors = performance_scores - self.tau
+
+        # Pinball loss formula: E[rho(Psi - tau)]
+        loss = torch.mean(
+            q * torch.relu(errors) + (1 - q) * torch.relu(-errors)
+        )
+        return loss, performance_scores
+
+# OPTION B: CVaR Loss (Targeting Worst-Case Tail)
+class CVaRLossWrapper(nn.Module):
+    def __init__(self, alpha, metric):
+        super().__init__()
+        self.alpha = alpha
+        self.metric = metric
+        # Initialize tau roughly where you expect the cost to be
+        self.tau = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, traj_x, traj_u):
+        # Ensure metric returns a VECTOR of performance scores [Batch_Size]: Tensor of scalar metrics Psi(D;K) for a batch of datasets.
+        performance_scores = self.metric.compute_per_sample_cost(traj_x, traj_u)
+
+        # CVaR formula: tau + (1/alpha) * E[max(0, Psi - tau)]
+        excess = torch.relu(performance_scores - self.tau)
+        loss = self.tau + (1.0 / self.alpha) * torch.mean(excess)
+
+        return loss, performance_scores
