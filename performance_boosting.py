@@ -224,6 +224,39 @@ class PBLoss(nn.Module):
 
         return per_sample_cost  # Shape: (Batch_Size,)
 
+    def compute_per_sample_costs(self, traj_x, traj_u):
+        """
+        Calculates the nominal cost and collision cost SEPARATELY
+        for EACH trajectory in the batch.
+        Returns:
+            cost_perf: (Batch_Size,)
+            cost_coll: (Batch_Size,)
+        """
+        batch_size, horizon, _ = traj_x.shape
+
+        # --- 1. Target Tracking & Control Effort (Nominal Performance) ---
+        error = traj_x - self.x_target
+        cost_target_t = torch.einsum('bhi,ij,bhj->bh', error, self.Q, error)
+        cost_u_t = torch.einsum('bhi,ij,bhj->bh', traj_u, self.R, traj_u)
+
+        # Mean over time to get scalar per trajectory
+        cost_perf = (cost_target_t + cost_u_t).mean(dim=1)
+
+        # --- 2. Obstacle Avoidance (Safety/Collision) ---
+        x_reshaped = traj_x.view(batch_size, horizon, self.n_agents, self.state_per_agent)
+        pos = x_reshaped[..., :2]
+        p = pos.unsqueeze(3)
+        m = self.mu.view(1, 1, 1, -1, 2)
+        s = self.sigma.view(1, 1, 1, -1, 2)
+
+        exponent = -0.5 * torch.sum(((p - m) ** 2) / (s ** 2 + 1e-6), dim=-1)
+        gaussian_density = torch.exp(exponent)
+
+        # Sum over agents/obstacles, mean over time
+        cost_coll = gaussian_density.sum(dim=(2, 3)).mean(dim=1)
+
+        return cost_perf, cost_coll  # Return both separately!
+
     def forward(self, traj_x, traj_u):
         """
         traj_x: (Batch, Horizon, Total_State_Dim)
@@ -311,5 +344,60 @@ class CVaRLossWrapper(nn.Module):
         # CVaR formula: tau + (1/alpha) * E[max(0, Psi - tau)]
         excess = torch.relu(performance_scores - self.tau)
         loss = self.tau + (1.0 / self.alpha) * torch.mean(excess)
+
+        return loss, performance_scores
+
+
+class SplitCVaRLossWrapper(nn.Module):
+    def __init__(self, alpha_cvar, lambda_obs, metric):
+        """
+        Args:
+            alpha_cvar: The tail probability for the collision CVaR (e.g., 0.05).
+            lambda_obs: The weight applied to the collision CVaR term.
+            metric: The PBLoss instance.
+        """
+        super().__init__()
+        self.alpha = alpha_cvar
+        self.lambda_obs = lambda_obs
+        self.metric = metric
+
+        # tau is now specifically the (1-alpha) quantile threshold for COLLISIONS
+        self.tau = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, traj_x, traj_u):
+        # 1. Get the separate cost vectors [Shape: Batch_Size]
+        cost_perf, cost_coll = self.metric.compute_per_sample_costs(traj_x, traj_u)
+
+        # 2. Compute Expected Nominal Performance
+        expected_perf = torch.mean(cost_perf)
+
+        # 3. Compute CVaR of Collision Cost
+        excess_coll = torch.relu(cost_coll - self.tau)
+        cvar_coll = self.tau + (1.0 / self.alpha) * torch.mean(excess_coll)
+
+        # 4. Total Split Loss
+        total_loss = expected_perf + (self.lambda_obs * cvar_coll)
+
+        return total_loss, expected_perf, cvar_coll
+
+class SoftmaxWorstCaseLossWrapper(nn.Module):
+    def __init__(self, beta, metric):
+        """
+        Args:
+            beta: Temperature parameter. Higher beta = closer to true max.
+            metric: The base loss function that computes per-sample costs.
+        """
+        super().__init__()
+        self.beta = beta
+        self.metric = metric
+
+    def forward(self, traj_x, traj_u):
+        # 1. Get the cost for each trajectory in the batch
+        # Returns a vector of shape [Batch_Size]
+        performance_scores = self.metric.compute_per_sample_cost(traj_x, traj_u)
+
+        # 2. Apply the log-sum-exp smooth approximation of the maximum
+        # Formula: (1/beta) * log(sum(exp(beta * raw_costs)))
+        loss = torch.logsumexp(self.beta * performance_scores, dim=0) / self.beta
 
         return loss, performance_scores
