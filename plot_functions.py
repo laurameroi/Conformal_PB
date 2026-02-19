@@ -207,3 +207,76 @@ def plot_pb_trajectories(traj_x, traj_u, traj_w_hat, x_target, obs_centers, obs_
     plt.tight_layout()
     plt.subplots_adjust(top=0.92)
     plt.show()
+
+
+def plot_nonconformity_histogram(calibration_result, bins=30, density=False, ax=None):
+    """
+    Plot histogram of non-conformity scores with threshold marker.
+
+    Args:
+        calibration_result: object with attributes `scores`, `threshold`, `alpha`.
+        bins: number of histogram bins.
+        density: whether to normalize histogram.
+        ax: optional matplotlib axis.
+    """
+    return plot_nonconformity_scores(
+        scores=calibration_result.scores,
+        threshold=calibration_result.threshold,
+        alpha=calibration_result.alpha,
+        bins=bins,
+        density=density,
+        ax=ax,
+    )
+
+
+def plot_nonconformity_scores(scores, threshold=None, alpha=None, bins=30, density=False, ax=None):
+    """
+    Plot histogram of non-conformity scores with optional threshold marker.
+
+    Args:
+        scores: non-conformity scores (Tensor or ndarray), shape (N,).
+        threshold: optional threshold value (scalar Tensor or float).
+        alpha: optional alpha label used in legend.
+        bins: number of histogram bins.
+        density: whether to normalize histogram.
+        ax: optional matplotlib axis.
+    """
+
+    if isinstance(scores, torch.Tensor):
+        scores_np = scores.detach().cpu().numpy()
+    else:
+        scores_np = np.asarray(scores)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
+    else:
+        fig = ax.figure
+
+    ax.hist(scores_np, bins=bins, density=density, alpha=0.75, color="#4C72B0", edgecolor="white")
+
+    if threshold is not None:
+        if isinstance(threshold, torch.Tensor):
+            threshold_value = float(threshold.detach().cpu().item())
+        else:
+            threshold_value = float(threshold)
+
+        if alpha is None:
+            label = "Calibration threshold"
+        else:
+            label = f"Conditional threshold, alpha={alpha:.3f}"
+
+        ax.axvline(
+            threshold_value,
+            color="#C44E52",
+            linestyle="--",
+            linewidth=2,
+            label=label,
+        )
+    ax.set_title("Non-conformity Score Distribution")
+    ax.set_xlabel("Non-conformity score")
+    ax.set_ylabel("Density" if density else "Count")
+    ax.grid(True, linestyle="--", alpha=0.35)
+    if threshold is not None:
+        ax.legend()
+
+    return fig, ax
