@@ -1,7 +1,7 @@
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Callable, Dict, Literal, List, Mapping, Optional
 
 import torch
 
@@ -24,9 +24,17 @@ class PBLossConfig:
     q: torch.Tensor
     r: torch.Tensor
     alpha_obs: float
-    obs_centers: list[torch.Tensor]
-    obs_sigmas: list[torch.Tensor]
+    obs_centers: List[torch.Tensor]
+    obs_sigmas: List[torch.Tensor]
     n_agents: int = 1
+
+
+@dataclass
+class ObstacleProximityConfig:
+    obs_centers: List[torch.Tensor]
+    delta_distance: float
+    n_agents: int = 1
+    state_per_agent: int = 4
 
 
 class NonConformityScorer(ABC):
@@ -38,31 +46,27 @@ class NonConformityScorer(ABC):
 
 
 class PBLossNonConformity(NonConformityScorer):
-    """
-    Native PB loss non-conformity (one score per trajectory).
-    """
+    """Native PB loss non-conformity (one score per trajectory)."""
 
     def __init__(self, config: PBLossConfig):
-        self.config = config
-        self.state_per_agent = 4
-
-    def _obstacle_cost(self, traj_x: torch.Tensor) -> torch.Tensor:
-        batch_size, horizon, _ = traj_x.shape
-
-        x_reshaped = traj_x.view(batch_size, horizon, self.config.n_agents, self.state_per_agent)
-        pos = x_reshaped[..., :2]  # (batch, horizon, n_agents, 2)
-
-        p = pos.unsqueeze(3)  # (batch, horizon, n_agents, 1, 2)
-        mu = torch.stack(self.config.obs_centers).to(traj_x.device).view(1, 1, 1, -1, 2)
-        sigma = torch.stack(self.config.obs_sigmas).to(traj_x.device).view(1, 1, 1, -1, 2)
-
-        exponent = -0.5 * torch.sum(((p - mu) ** 2) / (sigma ** 2 + 1e-6), dim=-1)
-        gaussian_density = torch.exp(exponent)
-        return self.config.alpha_obs * gaussian_density.sum(dim=(2, 3))
+        self._delegate = PBComponentNonConformity(config=config, component="total")
 
     def score_batch(self, trajectories: TrajectoryBatch) -> torch.Tensor:
-        traj_x = trajectories["x"]
-        traj_u = trajectories["u"]
+        return self._delegate.score_batch(trajectories)
+
+
+class PBComponentNonConformity(NonConformityScorer):
+    """
+    PB loss component non-conformity scorer.
+    """
+
+    def __init__(self, config: PBLossConfig, component: Literal["total", "target", "control", "collision"]):
+        self.config = config
+        self.component = component
+        self.state_per_agent = 4
+
+    def _pb_terms_per_sample(self, traj_x: torch.Tensor, traj_u: torch.Tensor) -> Dict[str, torch.Tensor]:
+        batch_size, horizon, _ = traj_x.shape
 
         x_target = self.config.x_target.to(traj_x.device)
         q = self.config.q.to(traj_x.device)
@@ -71,9 +75,72 @@ class PBLossNonConformity(NonConformityScorer):
         error = traj_x - x_target
         cost_target_t = torch.einsum("bhi,ij,bhj->bh", error, q, error)
         cost_u_t = torch.einsum("bhi,ij,bhj->bh", traj_u, r, traj_u)
-        cost_obs_t = self._obstacle_cost(traj_x)
 
-        return (cost_target_t + cost_u_t + cost_obs_t).mean(dim=1)
+        x_reshaped = traj_x.view(batch_size, horizon, self.config.n_agents, self.state_per_agent)
+        pos = x_reshaped[..., :2]
+        p = pos.unsqueeze(3)
+        mu = torch.stack(self.config.obs_centers).to(traj_x.device).view(1, 1, 1, -1, 2)
+        sigma = torch.stack(self.config.obs_sigmas).to(traj_x.device).view(1, 1, 1, -1, 2)
+
+        exponent = -0.5 * torch.sum(((p - mu) ** 2) / (sigma ** 2 + 1e-6), dim=-1)
+        gaussian_density = torch.exp(exponent)
+        cost_obs_t = self.config.alpha_obs * gaussian_density.sum(dim=(2, 3))
+
+        target = cost_target_t.mean(dim=1)
+        control = cost_u_t.mean(dim=1)
+        collision = cost_obs_t.mean(dim=1)
+        total = target + control + collision
+
+        return {
+            "target": target,
+            "control": control,
+            "collision": collision,
+            "total": total,
+        }
+
+    def score_batch(self, trajectories: TrajectoryBatch) -> torch.Tensor:
+        traj_x = trajectories["x"]
+        traj_u = trajectories["u"]
+        terms = self._pb_terms_per_sample(traj_x=traj_x, traj_u=traj_u)
+        return terms[self.component]
+
+
+class PBCollisionNonConformity(NonConformityScorer):
+    """Collision-only PB loss non-conformity (one score per trajectory)."""
+
+    def __init__(self, config: PBLossConfig):
+        self._delegate = PBComponentNonConformity(config=config, component="collision")
+
+    def score_batch(self, trajectories: TrajectoryBatch) -> torch.Tensor:
+        return self._delegate.score_batch(trajectories)
+
+
+class PBProximityFractionNonConformity(NonConformityScorer):
+    """
+    Fraction of trajectory duration spent within delta distance of any obstacle center.
+    Returns one scalar in [0, 1] per trajectory.
+    """
+
+    def __init__(self, config: ObstacleProximityConfig):
+        if config.delta_distance <= 0:
+            raise ValueError("delta_distance must be > 0")
+        if len(config.obs_centers) == 0:
+            raise ValueError("obs_centers must be non-empty")
+        self.config = config
+
+    def score_batch(self, trajectories: TrajectoryBatch) -> torch.Tensor:
+        traj_x = trajectories["x"]
+        batch_size, horizon, _ = traj_x.shape
+
+        x_reshaped = traj_x.view(batch_size, horizon, self.config.n_agents, self.config.state_per_agent)
+        pos = x_reshaped[..., :2]
+
+        mu = torch.stack(self.config.obs_centers).to(traj_x.device).view(1, 1, 1, -1, 2)
+        dists = torch.linalg.norm(pos.unsqueeze(3) - mu, dim=-1)
+
+        within_any_obstacle = (dists <= self.config.delta_distance).any(dim=3)
+        within_any_agent = within_any_obstacle.any(dim=2)
+        return within_any_agent.float().mean(dim=1)
 
 
 class CallableNonConformity(NonConformityScorer):
@@ -92,27 +159,46 @@ class CallableNonConformity(NonConformityScorer):
 def build_scorer(
     non_conformity_score: str,
     *,
-    pb_loss_config: PBLossConfig | None = None,
-    custom_callable: Callable[[TrajectoryBatch], torch.Tensor] | None = None,
+    pb_loss_config: Optional[PBLossConfig] = None,
+    proximity_config: Optional[ObstacleProximityConfig] = None,
+    custom_callable: Optional[Callable[[TrajectoryBatch], torch.Tensor]] = None,
 ) -> NonConformityScorer:
     """
     Factory that maps the notebook selector string to a scorer implementation.
     """
     score_name = non_conformity_score.lower()
 
-    if score_name == "pb_loss":
-        if pb_loss_config is None:
-            raise ValueError("pb_loss_config is required when non_conformity_score='pb_loss'")
-        return PBLossNonConformity(config=pb_loss_config)
-
     if score_name == "custom":
         if custom_callable is None:
             raise ValueError("custom_callable is required when non_conformity_score='custom'")
         return CallableNonConformity(custom_callable)
 
+    pb_component_by_name: Dict[str, Literal["total", "target", "control", "collision"]] = {
+        "pb_loss": "total",
+        "pb_collision": "collision",
+    }
+
+    if score_name in pb_component_by_name:
+        if pb_loss_config is None:
+            raise ValueError(
+                f"pb_loss_config is required when non_conformity_score='{score_name}'"
+            )
+        return PBComponentNonConformity(
+            config=pb_loss_config,
+            component=pb_component_by_name[score_name],
+        )
+
+    if score_name == "pb_proximity_fraction":
+        if proximity_config is None:
+            raise ValueError(
+                "proximity_config is required when non_conformity_score='pb_proximity_fraction'"
+            )
+        return PBProximityFractionNonConformity(config=proximity_config)
+
+    supported = [*pb_component_by_name.keys(), "pb_proximity_fraction", "custom"]
     raise ValueError(
         f"Unknown non-conformity score '{non_conformity_score}'. "
-        "Supported values: 'pb_loss', 'custom'."
+        f"Supported values: {supported}."
     )
 
 

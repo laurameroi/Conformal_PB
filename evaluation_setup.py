@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -106,7 +106,7 @@ def build_evaluation_system(ren_model: ContractiveREN, config: EvaluationConfig,
 def prepare_evaluation_context(
     checkpoint_path: str = "ren_standard_checkpoint.pt",
     device: str = "cpu",
-    config: EvaluationConfig | None = None,
+    config: Optional[EvaluationConfig] = None,
 ) -> Dict[str, Any]:
     config = config or EvaluationConfig()
     device_obj = torch.device(device)
@@ -139,3 +139,73 @@ def prepare_evaluation_context(
         "obs_centers": obs_centers,
         "obs_sigmas": obs_sigmas,
     }
+
+
+def prepare_multiple_evaluation_contexts(
+    checkpoints: Dict[str, str],
+    device: str = "cpu",
+    config: Optional[EvaluationConfig] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Prepare evaluation contexts for multiple models.
+
+    Args:
+        checkpoints: Dict mapping model names to checkpoint paths
+                    e.g., {"standard": "ren_standard.pt", "cvar": "ren_cvar.pt"}
+        device: Device string
+        config: Optional evaluation config (shared across all models)
+
+    Returns:
+        Dict with keys for each model name plus a "shared" key containing
+        common context (loss terms, config, etc.)
+    """
+    if not checkpoints:
+        raise ValueError("checkpoints dict must not be empty")
+
+    config = config or EvaluationConfig()
+    device_obj = torch.device(device)
+
+    # Build shared loss terms once
+    x_target, q, r, obs_centers, obs_sigmas = _build_loss_terms(config, device_obj)
+
+    results = {}
+    for model_name, checkpoint_path in checkpoints.items():
+        ren_bundle = load_ren_from_checkpoint(checkpoint_path=checkpoint_path, device=device_obj)
+        eval_system = build_evaluation_system(ren_bundle["ren_model"], config=config, device=device_obj)
+
+        metric = PBLoss(
+            x_target,
+            q,
+            r,
+            alpha_obs=config.alpha_obs,
+            obs_centers=obs_centers,
+            obs_sigmas=obs_sigmas,
+            n_agents=config.n_agents,
+        ).to(device_obj)
+
+        results[model_name] = {
+            "device": device_obj,
+            "config": config,
+            "dims": ren_bundle["dims"],
+            "load_result": ren_bundle["load_result"],
+            "eval_system": eval_system,
+            "metric": metric,
+            "x_target": x_target,
+            "Q": q,
+            "R": r,
+            "obs_centers": obs_centers,
+            "obs_sigmas": obs_sigmas,
+        }
+
+    # Add shared context with common loss terms
+    results["shared"] = {
+        "device": device_obj,
+        "config": config,
+        "x_target": x_target,
+        "Q": q,
+        "R": r,
+        "obs_centers": obs_centers,
+        "obs_sigmas": obs_sigmas,
+    }
+
+    return results
