@@ -21,6 +21,8 @@ class ModelVerificationResult:
     model_name: str
     scores: torch.Tensor
     threshold: torch.Tensor
+    quantile_value: float
+    mean_value: float
     fraction_below_threshold: float
 
 
@@ -184,13 +186,22 @@ def verify_conformal_multi_model(
             traj_test["x"], traj_test["u"], traj_test["w_hat"] = pb_loop.run(test_w)
         
         test_scores = nonconformity.compute_nonconformity_scores(traj_test, scorer)
-        fraction = (test_scores < calib_result.threshold).float().mean().item()
+        quantile_level = 1.0 - alpha
+        quantile_value = torch.quantile(
+            test_scores,
+            quantile_level,
+            interpolation="higher",
+        ).item()
+        mean_value = test_scores.mean().item()
+        fraction_below_threshold = (test_scores < calib_result.threshold).float().mean().item()
         
         model_results[model_name] = ModelVerificationResult(
             model_name=model_name,
             scores=test_scores,
             threshold=calib_result.threshold,
-            fraction_below_threshold=fraction,
+            quantile_value=quantile_value,
+            mean_value=mean_value,
+            fraction_below_threshold=fraction_below_threshold,
         )
     
     return VerificationResult(
@@ -241,7 +252,9 @@ def print_verification_summary(result: VerificationResult) -> None:
     
     for model_name, model_result in result.models.items():
         print(f"{model_name} model:")
-        print(f"  Threshold: {model_result.threshold.item():.6f}")
+        print(f"  Threshold (calibration): {model_result.threshold.item():.6f}")
+        print(f"  Test Quantile (1-alpha): {model_result.quantile_value:.6f}")
+        print(f"  Test Mean: {model_result.mean_value:.6f}")
         print(f"  Fraction(score < threshold): {model_result.fraction_below_threshold:.4f}")
         print()
     
