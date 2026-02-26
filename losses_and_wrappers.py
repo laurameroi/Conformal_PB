@@ -27,7 +27,6 @@ class PBLoss(nn.Module):
         self.state_per_agent = 4
         self.track_mode = track_mode
         self.coll_mode = coll_mode
-        self.obs_radii_safe = obs_radii_safe
 
         # Handle obs_radii_safe: Allow it to be a list or a float
         if isinstance(obs_radii_safe, list):
@@ -42,7 +41,7 @@ class PBLoss(nn.Module):
         self.register_buffer('Q', Q)
         self.register_buffer('R', R)
         self.register_buffer('mu', torch.stack(obs_centers).view(1, 1, 1, -1, 2))
-        self.register_buffer('variance', (torch.stack(obs_sigmas).view(1, 1, 1, -1, 2) ** 2) + 1e-6)
+        self.register_buffer('variance', (torch.stack(self.obs_sigmas).view(1, 1, 1, -1, 2) ** 2) + 1e-6)
 
     # --- 1. TRACKING TERM ---
     def compute_tracking_loss(self, error):

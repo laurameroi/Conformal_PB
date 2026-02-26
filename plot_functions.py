@@ -99,24 +99,37 @@ def plot_pb_trajectories(traj_x, traj_u, traj_w_hat, x_target, obs_centers, obs_
     if not isinstance(obs_radii, list): obs_radii = [obs_radii]
     if obs_radii_safe is not None and not isinstance(obs_radii_safe, list): obs_radii_safe = [obs_radii_safe]
 
+    import matplotlib.patches as patches
+
     for i, center in enumerate(obs_centers):
         c_np = to_numpy(center).flatten()
 
-        # Get the physical radius
-        r_tensor = obs_radii[i] if i < len(obs_radii) else obs_radii[0]
-        r_np = to_numpy(r_tensor).flatten()
+        # --- Handle Physical Radius ---
+        r_val = obs_radii[i] if i < len(obs_radii) else obs_radii[0]
+
+        # If it's a simple float, it's a circle (rx = ry)
+        if isinstance(r_val, (float, int)):
+            rx = ry = float(r_val)
+        # If it's a tensor/array, it could be an ellipse
+        else:
+            r_np = to_numpy(r_val).flatten()
+            rx, ry = r_np[0], r_np[1]
 
         # Draw the actual physical obstacle (Solid Gray)
-        # Note: patches.Ellipse takes (center, width, height). Width is 2*radius.
-        e1 = patches.Ellipse(c_np, 2 * r_np[0], 2 * r_np[1], color='#7f8c8d', alpha=0.7, zorder=0)
+        e1 = patches.Ellipse(c_np, 2 * rx, 2 * ry, color='#7f8c8d', alpha=0.7, zorder=0)
         ax.add_patch(e1)
 
-        # Draw the Safety Margin / Inflation Radius (Dashed Red)
+        # --- Handle Safety Margin / Inflation Radius ---
         if obs_radii_safe is not None:
-            rs_tensor = obs_radii_safe[i] if i < len(obs_radii_safe) else obs_radii_safe[0]
-            rs_np = to_numpy(rs_tensor).flatten()
+            rs_val = obs_radii_safe[i] if i < len(obs_radii_safe) else obs_radii_safe[0]
 
-            e2 = patches.Ellipse(c_np, 2 * rs_np[0], 2 * rs_np[1],
+            if isinstance(rs_val, (float, int)):
+                rs_x = rs_y = float(rs_val)
+            else:
+                rs_np = to_numpy(rs_val).flatten()
+                rs_x, rs_y = rs_np[0], rs_np[1]
+
+            e2 = patches.Ellipse(c_np, 2 * rs_x, 2 * rs_y,
                                  edgecolor='#e74c3c', fill=False, ls='--', lw=2, alpha=0.8, zorder=1)
             ax.add_patch(e2)
 
