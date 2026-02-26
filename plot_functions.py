@@ -61,7 +61,7 @@ def plot_trajectories(traj_tensor, dt=0.05):
     plt.show()
 
 
-def plot_pb_trajectories(traj_x, traj_u, traj_w_hat, x_target, obs_centers, obs_sigma, dt=0.05):
+def plot_pb_trajectories(traj_x, traj_u, traj_w_hat, x_target, obs_centers, obs_radii, obs_radii_safe, dt=0.05):
     """
     Advanced plotting for Multi-Agent PB Control.
     Plots obstacles and overlays statistics for any number of agents.
@@ -96,18 +96,29 @@ def plot_pb_trajectories(traj_x, traj_u, traj_w_hat, x_target, obs_centers, obs_
     fig1, ax = plt.subplots(figsize=(10, 8), dpi=100)
 
     # A. Draw Obstacles
-    if not isinstance(obs_sigma, list): obs_sigma = [obs_sigma]
+    if not isinstance(obs_radii, list): obs_radii = [obs_radii]
+    if obs_radii_safe is not None and not isinstance(obs_radii_safe, list): obs_radii_safe = [obs_radii_safe]
 
     for i, center in enumerate(obs_centers):
         c_np = to_numpy(center).flatten()
-        s_tensor = obs_sigma[i] if i < len(obs_sigma) else obs_sigma[0]
-        s_np = to_numpy(s_tensor).flatten()
 
-        e1 = patches.Ellipse(c_np, 2 * s_np[0], 2 * s_np[1], color='#7f8c8d', alpha=0.5, zorder=0)
+        # Get the physical radius
+        r_tensor = obs_radii[i] if i < len(obs_radii) else obs_radii[0]
+        r_np = to_numpy(r_tensor).flatten()
+
+        # Draw the actual physical obstacle (Solid Gray)
+        # Note: patches.Ellipse takes (center, width, height). Width is 2*radius.
+        e1 = patches.Ellipse(c_np, 2 * r_np[0], 2 * r_np[1], color='#7f8c8d', alpha=0.7, zorder=0)
         ax.add_patch(e1)
-        e2 = patches.Ellipse(c_np, 2 * s_np[0] + 0.2, 2 * s_np[1] + 0.2,
-                             color='#7f8c8d', fill=False, ls='--', alpha=0.5)
-        ax.add_patch(e2)
+
+        # Draw the Safety Margin / Inflation Radius (Dashed Red)
+        if obs_radii_safe is not None:
+            rs_tensor = obs_radii_safe[i] if i < len(obs_radii_safe) else obs_radii_safe[0]
+            rs_np = to_numpy(rs_tensor).flatten()
+
+            e2 = patches.Ellipse(c_np, 2 * rs_np[0], 2 * rs_np[1],
+                                 edgecolor='#e74c3c', fill=False, ls='--', lw=2, alpha=0.8, zorder=1)
+            ax.add_patch(e2)
 
     # B. Draw Target (Origin)
     ax.scatter(0, 0, c='gold', marker='*', s=400, edgecolors='k', zorder=20, label='Target')
@@ -206,4 +217,70 @@ def plot_pb_trajectories(traj_x, traj_u, traj_w_hat, x_target, obs_centers, obs_
 
     plt.tight_layout()
     plt.subplots_adjust(top=0.92)
+    plt.show()
+
+def plot_distance_tube(traj_x_erm, traj_x_q, obs_center, collision_radius):
+    """
+    Plots the conformal distance tube comparing ERM and Quantile trained controllers.
+
+    Args:
+        traj_x_erm: State trajectories from ERM model. Shape (batch_size, horizon, state_dim)
+        traj_x_q: State trajectories from Quantile model. Shape (batch_size, horizon, state_dim)
+        obs_center: The [x, y] coordinates of the obstacle center.
+        collision_radius: The radius of the obstacle (e.g., obs_sigmas[0][0]).
+    """
+    # 1. Ensure tensors are on CPU and converted to numpy arrays
+    if isinstance(traj_x_erm, torch.Tensor):
+        traj_x_erm = traj_x_erm.detach().cpu().numpy()
+    if isinstance(traj_x_q, torch.Tensor):
+        traj_x_q = traj_x_q.detach().cpu().numpy()
+    if isinstance(obs_center, torch.Tensor):
+        obs_center = obs_center.detach().cpu().numpy()
+
+    # Extract only the X and Y positions (assuming they are the first two state dimensions)
+    pos_erm = traj_x_erm[:, :, 0:2]
+    pos_q = traj_x_q[:, :, 0:2]
+
+    # 2. Calculate distances to the obstacle for every trajectory at every time step
+    dist_erm = np.linalg.norm(pos_erm - obs_center, axis=-1)
+    dist_q = np.linalg.norm(pos_q - obs_center, axis=-1)
+
+    time_steps = np.arange(dist_erm.shape[1])
+
+    # 3. Calculate the Median (50th) and Lower Bound (5th percentile)
+    # We care about the lower bound because closer = more dangerous!
+    erm_median = np.percentile(dist_erm, 50, axis=0)
+    erm_lower_bound = np.percentile(dist_erm, 5, axis=0)
+
+    q_median = np.percentile(dist_q, 50, axis=0)
+    q_lower_bound = np.percentile(dist_q, 5, axis=0)
+
+    # 4. Create the Plot
+    plt.figure(figsize=(10, 6))
+
+    # --- Plot ERM ---
+    plt.plot(time_steps, erm_median, color='red', linewidth=2, label='ERM Median Distance')
+    plt.fill_between(time_steps, erm_lower_bound, erm_median, color='red', alpha=0.2,
+                     label='ERM 5th Percentile (Worst-Case)')
+
+    # --- Plot Quantile ---
+    plt.plot(time_steps, q_median, color='blue', linewidth=2, label='Quantile Median Distance')
+    plt.fill_between(time_steps, q_lower_bound, q_median, color='blue', alpha=0.2,
+                     label='Quantile 5th Percentile (Worst-Case)')
+
+    # --- The Collision Boundary ---
+    plt.axhline(y=collision_radius, color='black', linestyle='--', linewidth=2, label='Collision Threshold')
+    plt.axhspan(0, collision_radius, color='black', alpha=0.1) # Shade the danger zone!
+
+    # --- Formatting ---
+    plt.title('Conformal Safety Bounds: Distance to Obstacle Over Time\n(Evaluating across unseen initial conditions)',
+              fontsize=14, fontweight='bold')
+    plt.xlabel('Time Step ($t$)', fontsize=12)
+    plt.ylabel('Distance to Obstacle', fontsize=12)
+
+    plt.ylim(bottom=0) # Distance cannot be negative
+    plt.legend(loc='upper right', fontsize=10)
+    plt.grid(True, linestyle=':', alpha=0.7)
+    plt.tight_layout()
+
     plt.show()
