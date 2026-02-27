@@ -28,20 +28,45 @@ class PBLoss(nn.Module):
         self.track_mode = track_mode
         self.coll_mode = coll_mode
 
-        # Handle obs_radii_safe: Allow it to be a list or a float
-        if isinstance(obs_radii_safe, list):
-            self.register_buffer('obs_radii_safe', torch.tensor(obs_radii_safe).float().view(1, 1, 1, -1))
-        else:
-            self.obs_radii_safe = float(obs_radii_safe)
-
-        self.obs_sigmas = [r / 2.0 for r in self.obs_radii_safe]
-
-        # Register Buffers
+        # Register Buffers for target and penalties
         self.register_buffer('x_target', x_target)
         self.register_buffer('Q', Q)
         self.register_buffer('R', R)
+
+        # 1. Process Obstacle Centers. Shape: [1, 1, 1, num_obs, 2]
         self.register_buffer('mu', torch.stack(obs_centers).view(1, 1, 1, -1, 2))
-        self.register_buffer('variance', (torch.stack(self.obs_sigmas).view(1, 1, 1, -1, 2) ** 2) + 1e-6)
+
+        # 2. Process Obstacle Radii
+
+        if isinstance(obs_radii_safe, list):
+            processed_radii = []
+            for r in obs_radii_safe:
+                # If it's a flat number like [0.3, [0.1, 0.5]]
+                if isinstance(r, (int, float)):
+                    processed_radii.append([float(r), float(r)])
+                # If it's a 1-element list like [[0.3], [0.1, 0.5]] (Your exact case)
+                elif isinstance(r, list) and len(r) == 1:
+                    processed_radii.append([float(r[0]), float(r[0])])
+                # If it's a 2-element list for an ellipse
+                elif isinstance(r, list) and len(r) == 2:
+                    processed_radii.append([float(r[0]), float(r[1])])
+                else:
+                    raise ValueError(f"Invalid radius format: {r}")
+
+            radii_t = torch.tensor(processed_radii, dtype=torch.float32)
+
+        else:
+            # Fallback if the user just passed a single global float like 0.3
+            radii_t = torch.tensor(obs_radii_safe, dtype=torch.float32)
+            if radii_t.dim() == 0:
+                radii_t = radii_t.view(1, 1).repeat(len(obs_centers), 2)
+
+        # Store safe radii and variance. Shape: [1, 1, 1, num_obs, 2]
+        self.register_buffer('obs_radii_safe', radii_t.view(1, 1, 1, -1, 2))
+
+        # Variance is defined as (radius / 2)^2
+        variance_t = (radii_t / 2.0) ** 2 + 1e-6
+        self.register_buffer('variance', variance_t.view(1, 1, 1, -1, 2))
 
     # --- 1. TRACKING TERM ---
     def compute_tracking_loss(self, error):
@@ -52,9 +77,6 @@ class PBLoss(nn.Module):
         """
         if self.track_mode == 'quadratic':
             return torch.einsum('bhi,ij,bhj->bh', error, self.Q, error).mean(dim=1)
-        elif self.track_mode == 'euclidean':
-            #error = error[..., :2]
-            return torch.norm(error, dim=-1).mean(dim=1)
         elif self.track_mode == 'weighted_euclidean':
             # 1. Compute e^T Q e for every timestep: [Batch, Horizon]
             quad_form = torch.einsum('bhi,ij,bhj->bh', error, self.Q, error)
@@ -67,41 +89,34 @@ class PBLoss(nn.Module):
 
     # --- 2. COLLISION TERM ---
     def compute_collision_loss(self, pos):
-        """
-        Calculates the penalty for being near obstacles.
-        Inputs:  pos  [batch_size, horizon, n_agents, 2]
-        Outputs: cost [batch_size]
-        """
-        batch_size = pos.shape[0]
-
         diff = pos.unsqueeze(3) - self.mu
-        # For all distance-based methods
-        distances = torch.norm(diff, p=2, dim=-1)  # [B, H, Agents, Obs]
-        violation = torch.relu(self.obs_radii_safe - distances)
+
+        # Compute a normalized distance for ellipsoids: norm((x-cx)/rx, (y-cy)/ry)
+        # If scaled_dist <= 1.0, the agent is inside the obstacle's safe boundary.
+        scaled_diff = diff / self.obs_radii_safe
+        scaled_dist = torch.norm(scaled_diff, p=2, dim=-1)
+
+        # To keep violation magnitude in physical units (meters), multiply by the average radius.
+        avg_radii = self.obs_radii_safe.mean(dim=-1)
+        violation = torch.relu(1.0 - scaled_dist) * avg_radii
 
         if self.coll_mode == 'rbf':
-            exponent = -0.5 * torch.sum((diff** 2) / self.variance, dim=-1)
+            exponent = -0.5 * torch.sum((diff ** 2) / self.variance, dim=-1)
             return self.lambda_obs * torch.exp(exponent).sum(dim=(2, 3)).mean(dim=1)
 
         elif self.coll_mode == 'shifted_rbf':
-            # 1. Calculate standard RBF
-            exponent = -0.5 * torch.sum(((pos.unsqueeze(3) - self.mu) ** 2) / self.variance, dim=-1)
+            exponent = -0.5 * torch.sum((diff ** 2) / self.variance, dim=-1)
             raw_rbf = torch.exp(exponent)
-
-            # 2. Calculate what the RBF value is at the exact boundary of obs_radii_safe
-            # (Assuming variance is roughly the same in x and y for the distance threshold)
-            rbf_at_margin = torch.exp(-0.5 * (self.obs_radii_safe ** 2) / self.variance[..., 0])
-
-            # 3. Shift the RBF down, and apply ReLU to zero out anything outside the margin
+            # Constant margin exponent for any geometry
+            rbf_at_margin = torch.exp(torch.tensor(-2.0, device=diff.device))
             shifted_rbf = torch.relu(raw_rbf - rbf_at_margin)
-
             return self.lambda_obs * shifted_rbf.sum(dim=(2, 3)).mean(dim=1)
 
         elif self.coll_mode == 'hinge':
             return self.lambda_obs * violation.sum(dim=(2, 3)).mean(dim=1)
 
         elif self.coll_mode == 'softplus':
-            soft_viol = F.softplus(self.obs_radii_safe - distances, beta=10.0)
+            soft_viol = F.softplus(1.0 - scaled_dist, beta=10.0) * avg_radii
             return self.lambda_obs * soft_viol.sum(dim=(2, 3)).mean(dim=1)
 
         elif self.coll_mode == 'squared_hinge':
@@ -109,6 +124,7 @@ class PBLoss(nn.Module):
 
         else:
             raise ValueError(f"Unknown collision mode: {self.coll_mode}")
+
 
     # --- 3. ACTUATION TERM ---
     def compute_actuation_loss(self, traj_u):
