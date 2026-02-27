@@ -259,13 +259,13 @@ class RobotPlant(torch.nn.Module):
         """
         return self.run(x0, u_ext, output_noise)
 
-class ProportionalController(nn.Module):
-    def __init__(self, kp=None, y_target=None, n_agents=2):
+class PDController(nn.Module):
+    def __init__(self, kp, ki, y_target=None, n_agents=2):
         """
-        Initializes the Proportional Controller.
+        Initializes the PDController.
 
         This controller is designed to work with the 'RobotPlant' class.
-        It implements the control law: u = Kp * (p_target - p)
+        It implements the control law: u = K * (p_target - p)
 
         Args:
             kp (torch.Tensor, optional): Gain matrix. If None, defaults to identity (spring-like).
@@ -278,6 +278,7 @@ class ProportionalController(nn.Module):
         self.input_k_dim = 4 * self.n_agents  # Input to controller (Plant Output): [px, py, vx, vy]
         self.output_k_dim = 2 * self.n_agents  # Output of controller (Plant Input): [Fx, Fy]
         self.kp = kp
+        self.ki = ki
 
         # --- 1. Handle Target State (y_target) ---
         if y_target is None:
@@ -290,34 +291,19 @@ class ProportionalController(nn.Module):
         self.register_buffer('y_target', target_tensor)
 
         # --- 2. Handle Gain Matrix (Kp) ---
-        if self.kp is None:
-            # Default Gain: Acts as a spring (Position Control)
-            # We want Force_x = 1.0 * (Target_x - Pos_x)
-            # We want Force_y = 1.0 * (Target_y - Pos_y)
-
-            # Base matrix for 1 agent: shape (2, 4)
-            # Rows are outputs (Fx, Fy), Columns are inputs (px, py, vx, vy)
-            default_kp = torch.tensor([
-                [1.0, 0.0, 0.0, 0.0],  # Fx depends on px
-                [0.0, 1.0, 0.0, 0.0]  # Fy depends on py
-            ], dtype=torch.float32)
-
-            # Expand for N agents (Block Diagonal)
-            kp_tensor = torch.kron(torch.eye(self.n_agents), default_kp)
-        else:
-            kp_tensor = torch.tensor([
-                [self.kp, 0.0, 0.0, 0.0],  # Fx depends on px
-                [0.0, self.kp, 0.0, 0.0]  # Fy depends on py
-            ], dtype=torch.float32)
-            kp_tensor = torch.kron(torch.eye(self.n_agents), kp_tensor)
+        k_tensor = torch.tensor([
+            [self.kp, 0.0, self.ki, 0.0],  # Fx depends on px
+            [0.0, self.kp, 0.0, self.ki]  # Fy depends on py
+        ], dtype=torch.float32)
+        k_tensor = torch.kron(torch.eye(self.n_agents), k_tensor)
 
 
         # Check dimensions: Kp must be (output_dim, input_dim) -> (2, 4)
         expected_shape = (self.output_k_dim, self.input_k_dim)
-        assert kp_tensor.shape == expected_shape, f"Kp shape mismatch. Expected {expected_shape}, got {kp_tensor.shape}"
+        assert k_tensor.shape == expected_shape, f"K shape mismatch. Expected {expected_shape}, got {k_tensor.shape}"
 
-        # Register Kp as a buffer (physics constant, not learned)
-        self.register_buffer('kp_tensor', kp_tensor)
+        # Register K as a buffer (physics constant, not learned)
+        self.register_buffer('k_tensor', k_tensor)
 
     def forward(self, y):
         """
@@ -342,7 +328,7 @@ class ProportionalController(nn.Module):
 
         # 3. Compute Control Input
         # u = Kp * error
-        u = F.linear(error, self.kp_tensor)
+        u = F.linear(error, self.k_tensor)
 
         return u
 
