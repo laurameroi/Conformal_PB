@@ -36,6 +36,9 @@ class PBLoss(nn.Module):
         # 1. Process Obstacle Centers. Shape: [1, 1, 1, num_obs, 2]
         self.register_buffer('mu', torch.stack(obs_centers).view(1, 1, 1, -1, 2))
 
+        self.lambda_agent = 10.0  # Weight penalty for agents hitting each other
+        self.agent_margin = 0.2  # Minimum safe distance between two agents (in meters)
+
         # 2. Process Obstacle Radii
 
         if isinstance(obs_radii_safe, list):
@@ -89,42 +92,90 @@ class PBLoss(nn.Module):
 
     # --- 2. COLLISION TERM ---
     def compute_collision_loss(self, pos):
-        diff = pos.unsqueeze(3) - self.mu
-
+        # ==========================================
+        # A. STATIC OBSTACLE COLLISION AVOIDANCE
+        # ==========================================
+        diff_obs = pos.unsqueeze(3) - self.mu
         # Compute a normalized distance for ellipsoids: norm((x-cx)/rx, (y-cy)/ry)
         # If scaled_dist <= 1.0, the agent is inside the obstacle's safe boundary.
-        scaled_diff = diff / self.obs_radii_safe
-        scaled_dist = torch.norm(scaled_diff, p=2, dim=-1)
+        scaled_diff_obs = diff_obs / self.obs_radii_safe
+        scaled_dist_obs = torch.norm(scaled_diff_obs, p=2, dim=-1)
 
-        # To keep violation magnitude in physical units (meters), multiply by the average radius.
         avg_radii = self.obs_radii_safe.mean(dim=-1)
-        violation = torch.relu(1.0 - scaled_dist) * avg_radii
+        violation_obs = torch.relu(1.0 - scaled_dist_obs) * avg_radii
 
         if self.coll_mode == 'rbf':
-            exponent = -0.5 * torch.sum((diff ** 2) / self.variance, dim=-1)
-            return self.lambda_obs * torch.exp(exponent).sum(dim=(2, 3)).mean(dim=1)
+            exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
+            cost_obs = self.lambda_obs * torch.exp(exponent_obs).sum(dim=(2, 3)).mean(dim=1)
 
         elif self.coll_mode == 'shifted_rbf':
-            exponent = -0.5 * torch.sum((diff ** 2) / self.variance, dim=-1)
-            raw_rbf = torch.exp(exponent)
-            # Constant margin exponent for any geometry
-            rbf_at_margin = torch.exp(torch.tensor(-2.0, device=diff.device))
+            exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
+            raw_rbf = torch.exp(exponent_obs)
+            rbf_at_margin = torch.exp(torch.tensor(-2.0, device=diff_obs.device))
             shifted_rbf = torch.relu(raw_rbf - rbf_at_margin)
-            return self.lambda_obs * shifted_rbf.sum(dim=(2, 3)).mean(dim=1)
+            cost_obs = self.lambda_obs * shifted_rbf.sum(dim=(2, 3)).mean(dim=1)
 
         elif self.coll_mode == 'hinge':
-            return self.lambda_obs * violation.sum(dim=(2, 3)).mean(dim=1)
+            cost_obs = self.lambda_obs * violation_obs.sum(dim=(2, 3)).mean(dim=1)
 
         elif self.coll_mode == 'softplus':
-            soft_viol = F.softplus(1.0 - scaled_dist, beta=10.0) * avg_radii
-            return self.lambda_obs * soft_viol.sum(dim=(2, 3)).mean(dim=1)
+            soft_viol_obs = F.softplus(1.0 - scaled_dist_obs, beta=10.0) * avg_radii
+            cost_obs = self.lambda_obs * soft_viol_obs.sum(dim=(2, 3)).mean(dim=1)
 
         elif self.coll_mode == 'squared_hinge':
-            return self.lambda_obs * (violation ** 2).sum(dim=(2, 3)).mean(dim=1)
+            cost_obs = self.lambda_obs * (violation_obs ** 2).sum(dim=(2, 3)).mean(dim=1)
 
         else:
             raise ValueError(f"Unknown collision mode: {self.coll_mode}")
 
+        # ==========================================
+        # B. INTER-AGENT COLLISION AVOIDANCE
+        # ==========================================
+        cost_agents = 0.0
+
+        # Only compute if there are multiple agents and an agent penalty is defined
+        lambda_agent = getattr(self, 'lambda_agent', 0.0)
+
+        if self.n_agents > 1 and lambda_agent > 0.0:
+            agent_margin = getattr(self, 'agent_margin', 0.2)  # Safe distance between agents
+
+            # Pairwise differences [B, H, N, 1, 2] - [B, H, 1, N, 2] -> [B, H, N, N, 2]
+            diff_agents = pos.unsqueeze(3) - pos.unsqueeze(2)
+            dist_agents = torch.norm(diff_agents, p=2, dim=-1)  # Shape: [B, H, N, N]
+
+            # Mask out self-collisions (diagonal) by artificially adding a massive distance
+            eye = torch.eye(self.n_agents, device=pos.device).view(1, 1, self.n_agents, self.n_agents)
+            dist_agents_masked = dist_agents + (eye * 1e6)
+
+            violation_agents = torch.relu(agent_margin - dist_agents_masked)
+
+            # We divide by 2.0 at the end because pair (i,j) and pair (j,i) are counted twice
+            if self.coll_mode == 'rbf':
+                var_agents = (agent_margin / 2.0) ** 2
+                exponent_agents = -0.5 * (dist_agents_masked ** 2) / var_agents
+                rbf_agents = torch.exp(exponent_agents) * (1.0 - eye)
+                cost_agents = lambda_agent * rbf_agents.sum(dim=(2, 3)).mean(dim=1) / 2.0
+
+            elif self.coll_mode == 'shifted_rbf':
+                var_agents = (agent_margin / 2.0) ** 2
+                exponent_agents = -0.5 * (dist_agents_masked ** 2) / var_agents
+                raw_rbf_agents = torch.exp(exponent_agents)
+                rbf_at_margin_agents = torch.exp(torch.tensor(-2.0, device=pos.device))
+                shifted_rbf_agents = torch.relu(raw_rbf_agents - rbf_at_margin_agents) * (1.0 - eye)
+                cost_agents = lambda_agent * shifted_rbf_agents.sum(dim=(2, 3)).mean(dim=1) / 2.0
+
+            elif self.coll_mode == 'hinge':
+                cost_agents = lambda_agent * violation_agents.sum(dim=(2, 3)).mean(dim=1) / 2.0
+
+            elif self.coll_mode == 'softplus':
+                soft_viol_agents = F.softplus(agent_margin - dist_agents_masked, beta=10.0) * (1.0 - eye)
+                cost_agents = lambda_agent * soft_viol_agents.sum(dim=(2, 3)).mean(dim=1) / 2.0
+
+            elif self.coll_mode == 'squared_hinge':
+                cost_agents = lambda_agent * (violation_agents ** 2).sum(dim=(2, 3)).mean(dim=1) / 2.0
+
+        # Return the combined cost!
+        return cost_obs + cost_agents
 
     # --- 3. ACTUATION TERM ---
     def compute_actuation_loss(self, traj_u):
