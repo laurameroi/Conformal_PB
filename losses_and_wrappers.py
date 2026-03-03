@@ -229,13 +229,13 @@ class ERMWrapper(nn.Module):
 
 
 class CVaRLossWrapper(nn.Module):
-    def __init__(self, alpha, metric):
+    def __init__(self, alpha, metric, tau_init=0.0):
         super().__init__()
         self.alpha = alpha
         self.metric = metric
 
         # tau is the learnable threshold for the (1-alpha) quantile
-        self.tau = nn.Parameter(torch.tensor(0.0))
+        self.tau = nn.Parameter(torch.tensor(tau_init))
 
     def forward(self, traj_x, traj_u):
         """
@@ -261,12 +261,12 @@ class CVaRLossWrapper(nn.Module):
         return cvar_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
 
 class SplitCVaRLossWrapper(nn.Module):
-    def __init__(self, alpha, lambda_decoupling, metric):
+    def __init__(self, alpha, lambda_decoupling, metric, tau_init=0.0):
         super().__init__()
         self.alpha = alpha
         self.lambda_decoupling = lambda_decoupling
         self.metric = metric
-        self.tau = nn.Parameter(torch.tensor(0.0))
+        self.tau = nn.Parameter(torch.tensor(tau_init))
 
     def forward(self, traj_x, traj_u):
         """
@@ -296,19 +296,19 @@ class SplitCVaRLossWrapper(nn.Module):
 
         return total_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
 
-class HardConstraintCVaRLossWrapper(nn.Module):
-    def __init__(self, alpha, tau_safe_bar, metric):
+class LagrangianCVaRLossWrapper(nn.Module):
+    def __init__(self, alpha, tau_safe_bar, metric, tau_init=0.0, lambda_init=1.0):
         super().__init__()
         self.alpha = alpha
         self.tau_safe_bar = tau_safe_bar
         self.metric = metric
 
         # Primal parameter (Minimized)
-        self.tau = nn.Parameter(torch.tensor(0.0))
+        self.tau = nn.Parameter(torch.tensor(tau_init))
 
         # Dual parameter (Maximized).
         # We optimize a raw value and apply softplus to guarantee lambda >= 0
-        self.pre_lambda = nn.Parameter(torch.tensor(0.0))
+        self.pre_lambda = nn.Parameter(torch.tensor(lambda_init))
 
     def forward(self, traj_x, traj_u):
         """
@@ -345,6 +345,51 @@ class HardConstraintCVaRLossWrapper(nn.Module):
 
         return lagrangian, expected_perf, cvar_coll, lambda_dual, constraint_violation
 
+class LagrangianERMLossWrapper(nn.Module):
+    def __init__(self, alpha, tau_safe_bar, metric, lambda_init=0.0):
+        super().__init__()
+        self.alpha = alpha
+        self.tau_safe_bar = tau_safe_bar
+        self.metric = metric
+
+        # Dual parameter (Maximized).
+        # We optimize a raw value and apply softplus to guarantee lambda >= 0
+        self.pre_lambda = nn.Parameter(torch.tensor(lambda_init))
+
+    def forward(self, traj_x, traj_u):
+        """
+        Inputs:
+            traj_x: [batch_size, horizon, state_dim]
+            traj_u: [batch_size, horizon, input_dim]
+
+        Outputs:
+            Tuple of 5 elements:
+            1. lagrangian: [scalar tensor] The combined objective to be minimized/maximized.
+            2. expected_perf: [float] Sum of tracking + actuation costs.
+            3. expected_coll: [float] Calculated expected value of collisions.
+            4. lambda_dual: [float] Current value of the dual multiplier.
+            5. constraint_violation: [float] Raw margin of safety violation.
+        """
+        # Retrieve the individual vectors of shape [Batch_Size]
+        _, cost_x, cost_u, cost_coll = self.metric(traj_x, traj_u)
+
+        # 1. ERM on tracking performance (Psi_perf)
+        expected_perf = cost_x.mean() + cost_u.mean()
+
+        # 2. ERM on collision penalty (Psi_safe)
+        expected_coll = cost_coll.mean()
+
+        # 3. Constraint Violation
+        # If expected_coll > tau_safe_bar, this is positive (penalized).
+        # If expected_coll < tau_safe_bar, this is negative (constraint satisfied).
+        constraint_violation = expected_coll - self.tau_safe_bar
+
+        # 4. Lagrangian Formulation
+        lambda_dual = F.softplus(self.pre_lambda)
+        lagrangian = expected_perf + (lambda_dual * constraint_violation)
+
+        return lagrangian, expected_perf, expected_coll, lambda_dual, constraint_violation
+
 class SoftmaxWorstCaseLossWrapper(nn.Module):
     def __init__(self, beta, metric):
         """
@@ -380,11 +425,11 @@ class SoftmaxWorstCaseLossWrapper(nn.Module):
         return softmax_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
 
 class PinballLossWrapper(nn.Module):
-    def __init__(self, alpha, metric):
+    def __init__(self, alpha, metric, tau_init=0.0):
         super().__init__()
         self.alpha = alpha
         self.metric = metric
-        self.tau = nn.Parameter(torch.tensor(0.0))
+        self.tau = nn.Parameter(torch.tensor(tau_init))
 
     def forward(self, traj_x, traj_u):
         """

@@ -72,8 +72,7 @@ class RobotControlDataset(Dataset):
         # Returns (initial_state, input_trajectory)
         return self.w[idx]
 
-
-def generate_random_batch(
+def generate_random_batch_old(
         batch_size,
         horizon,
         n_agents=1,
@@ -92,6 +91,89 @@ def generate_random_batch(
         x0_stds: List of standard deviations corresponding to each center.
         x0_probs: List of probabilities for selecting each center (must sum to 1).
     """
+    state_dim_per_agent = 4
+    state_dim = state_dim_per_agent * n_agents
+
+    # --- 1. Process Inputs & Set Defaults ---
+    if x0_centers is None:
+        x0_centers = [[-1.0, -1.0]]  # Default to a single center
+
+    # Standardize centers to shape (num_modes, n_agents * 2)
+    processed_centers = []
+    for c in x0_centers:
+        if not isinstance(c, torch.Tensor):
+            c = torch.tensor(c, dtype=torch.float32)
+        if c.numel() == 2:  # Auto-repeat (x, y) for all agents
+            c = c.repeat(n_agents)
+        processed_centers.append(c)
+    centers_tensor = torch.stack(processed_centers)
+
+    num_modes = centers_tensor.shape[0]
+
+    # Default stds to 0.2 if not provided
+    if x0_stds is None:
+        stds_tensor = torch.full((num_modes,), 0.2)
+    else:
+        stds_tensor = torch.tensor(x0_stds, dtype=torch.float32)
+
+    # Default probabilities to uniform if not provided
+    if x0_probs is None:
+        probs_tensor = torch.ones(num_modes) / num_modes
+    else:
+        probs_tensor = torch.tensor(x0_probs, dtype=torch.float32)
+        probs_tensor = probs_tensor / probs_tensor.sum()  # Ensure they sum to 1
+
+    # --- 2. Sample Modes ---
+    # mode_indices shape: (batch_size,)
+    mode_indices = torch.multinomial(probs_tensor, batch_size, replacement=True)
+
+    # --- 3. Gather Chosen Parameters ---
+    # chosen_centers shape: (batch_size, n_agents * 2)
+    chosen_centers = centers_tensor[mode_indices]
+
+    # chosen_stds shape: (batch_size,) -> Reshaped to (batch_size, 1, 1) for broadcasting
+    chosen_stds = stds_tensor[mode_indices].view(batch_size, 1, 1)
+
+    # --- 4. Generate Initial States ---
+    pos_center = chosen_centers.unsqueeze(1)  # Shape: (batch_size, 1, n_agents * 2)
+    pos_noise = torch.randn(batch_size, 1, n_agents * 2) * chosen_stds
+    pos = pos_center + pos_noise
+
+    vel = torch.zeros(batch_size, 1, n_agents * 2)
+
+    # Reshape and concatenate
+    pos_reshaped = pos.view(batch_size, 1, n_agents, 2)
+    vel_reshaped = vel.view(batch_size, 1, n_agents, 2)
+    state_reshaped = torch.cat((pos_reshaped, vel_reshaped), dim=-1)
+
+    x0_data = state_reshaped.view(batch_size, 1, state_dim)
+
+    # --- 5. Generate Horizon Noise and Inject Initial State ---
+    w = noise_std * torch.randn(batch_size, horizon, state_dim)
+    w[:, 0, :] = x0_data[:, 0, :]
+
+    return w.to(device)
+
+def generate_random_batch(config, custom_batch_size=None):
+    """
+    Generates a batch of initial conditions from a custom Gaussian Mixture Model.
+
+    Args:
+        config: The ExperimentConfig object containing all dataset parameters.
+        custom_batch_size: Optional int to override the config.batch_size (e.g., for validation/testing).
+    """
+    # Use custom size if provided, otherwise default to config.batch_size
+    batch_size = custom_batch_size if custom_batch_size is not None else config.batch_size
+
+    # Extract remaining parameters directly from config
+    horizon = config.horizon
+    n_agents = config.n_agents
+    x0_centers = config.x0_centers
+    x0_stds = config.x0_stds
+    x0_probs = config.x0_probs
+    noise_std = config.noise_std
+    device = config.device
+
     state_dim_per_agent = 4
     state_dim = state_dim_per_agent * n_agents
 
