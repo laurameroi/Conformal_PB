@@ -115,15 +115,35 @@ class PBLoss(nn.Module):
             shifted_rbf = torch.relu(raw_rbf - rbf_at_margin)
             cost_obs = self.lambda_obs * shifted_rbf.sum(dim=(2, 3)).mean(dim=1)
 
-        elif self.coll_mode == 'hinge':
-            cost_obs = self.lambda_obs * violation_obs.sum(dim=(2, 3)).mean(dim=1)
-
         elif self.coll_mode == 'softplus':
             soft_viol_obs = F.softplus(1.0 - scaled_dist_obs, beta=10.0) * avg_radii
             cost_obs = self.lambda_obs * soft_viol_obs.sum(dim=(2, 3)).mean(dim=1)
 
-        elif self.coll_mode == 'squared_hinge':
+        elif self.coll_mode == 'hinge':
+            cost_obs = self.lambda_obs * violation_obs.sum(dim=(2, 3)).mean(dim=1)
+
+        elif self.coll_mode == 'squared_hinge': #average over horizon
             cost_obs = self.lambda_obs * (violation_obs ** 2).sum(dim=(2, 3)).mean(dim=1)
+
+        elif self.coll_mode == 'max_hinge': #max over horizon
+            # violation_obs shape: [batch_size, horizon, n_agents, n_obstacles]
+
+            # 1. Find the MAXIMUM violation across the time horizon (dim=1)
+            # This mathematically perfectly corresponds to the MINIMUM scaled distance to the center.
+            max_violation_over_time = violation_obs.amax(dim=1)  # shape: [batch, n_agents, n_obs]
+
+            # 2. Sum the worst-case penalties across all agents and obstacles
+            cost_obs = self.lambda_obs * max_violation_over_time.sum(dim=(1, 2))
+
+        elif self.coll_mode == 'min_euclidean_metric':
+            # Compute pure, unscaled Euclidean distance to the center in meters
+            euclidean_dist = torch.norm(diff_obs, p=2, dim=-1)  # [batch, horizon, agents, obs]
+
+            # Find the absolute minimum distance across the entire horizon
+            min_dist_to_center = euclidean_dist.amin(dim=1)  # [batch, agents, obs]
+
+            # You could return this for logging, but do NOT minimize this directly!
+            cost_obs = min_dist_to_center.mean(dim=(1, 2))  # Just aggregating for output
 
         else:
             raise ValueError(f"Unknown collision mode: {self.coll_mode}")
@@ -258,7 +278,7 @@ class CVaRLossWrapper(nn.Module):
         cvar_loss = self.tau + (1.0 / self.alpha) * torch.mean(excess)
 
         # Return the optimized CVaR loss, plus the standard averages for logging
-        return cvar_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
+        return cvar_loss, cost_x.mean(), cost_u.mean(), cvar_loss
 
 class SplitCVaRLossWrapper(nn.Module):
     def __init__(self, alpha, lambda_decoupling, metric, tau_init=0.0):
@@ -294,7 +314,7 @@ class SplitCVaRLossWrapper(nn.Module):
         # 3. Total Loss
         total_loss = expected_perf + (self.lambda_decoupling * cvar_coll)
 
-        return total_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
+        return total_loss, cost_x.mean(), cost_u.mean(), cvar_coll
 
 class LagrangianCVaRLossWrapper(nn.Module):
     def __init__(self, alpha, tau_safe_bar, metric, tau_init=0.0, lambda_init=1.0):
@@ -346,7 +366,7 @@ class LagrangianCVaRLossWrapper(nn.Module):
         return lagrangian, expected_perf, cvar_coll, lambda_dual, constraint_violation
 
 class LagrangianERMLossWrapper(nn.Module):
-    def __init__(self, alpha, tau_safe_bar, metric, lambda_init=0.0):
+    def __init__(self, alpha, tau_safe_bar, metric, lambda_init=1.0):
         super().__init__()
         self.alpha = alpha
         self.tau_safe_bar = tau_safe_bar
