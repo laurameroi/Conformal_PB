@@ -1,13 +1,8 @@
 import copy
 import torch
 import matplotlib.pyplot as plt
-<<<<<<< HEAD
-from tqdm.notebook import tqdm
-
-=======
 from tqdm import tqdm
 import copy
->>>>>>> 77b4892 (Implement nonconformity score based on signed distance, create lambda search notebook)
 
 def train_agent(
         config,
@@ -32,6 +27,13 @@ def train_agent(
 
     print(f"Starting {mode.upper()} online training on {config.device}...")
 
+    dual_lr_multiplier = getattr(config, 'dual_lr_multiplier', 20.0)
+    dual_near_feasible_factor = getattr(config, 'dual_near_feasible_factor', 0.2)
+    dual_feasibility_margin = getattr(config, 'dual_feasibility_margin', 0.02)
+    dual_far_feasible_factor = getattr(config, 'dual_far_feasible_factor', 3.0)
+    dual_far_violation_threshold = getattr(config, 'dual_far_violation_threshold', 0.1)
+    dual_base_lr = config.lr * dual_lr_multiplier
+
     # ==========================================
     # 1. Optimizer Setup
     # ==========================================
@@ -48,14 +50,14 @@ def train_agent(
     elif mode == "lagrangian_mse":
         # No Tau in ERM Lagrangian
         opt_primal = torch.optim.Adam(sim.parameters(), lr=config.lr)
-        opt_dual = torch.optim.Adam([loss_wrapper.pre_lambda], lr=config.lr * 0.1, maximize=True)
+        opt_dual = torch.optim.Adam([loss_wrapper.pre_lambda], lr=dual_base_lr, maximize=True)
 
     elif mode == "lagrangian_cvar":
         opt_primal = torch.optim.Adam([
             {'params': sim.parameters(), 'lr': config.lr},
             {'params': [loss_wrapper.tau], 'lr': config.lr * 10.0}
         ])
-        opt_dual = torch.optim.Adam([loss_wrapper.pre_lambda], lr=config.lr * 0.1, maximize=True)
+        opt_dual = torch.optim.Adam([loss_wrapper.pre_lambda], lr=dual_base_lr, maximize=True)
 
     # ==========================================
     # 2. Tracking Setup & Early Stopping
@@ -68,6 +70,7 @@ def train_agent(
     best_val_metric = float('inf')
     best_model_state = None
     best_tau = None
+    best_pre_lambda = None
     patience_counter = 0
     patience_limit = config.early_stopping_patience_limit
 
@@ -109,9 +112,27 @@ def train_agent(
             opt_dual.zero_grad()
             batch_w_dual = generate_random_batch(config)
             traj_x_dual, traj_u_dual, _ = sim.run(batch_w_dual)
-            loss_dual, _, _, _, _ = loss_wrapper(traj_x_dual, traj_u_dual)
+            loss_dual, _, _, _, dual_violation = loss_wrapper(traj_x_dual, traj_u_dual)
+
+            dual_violation_value = dual_violation.item() if hasattr(dual_violation, 'item') else float(dual_violation)
+            near_feasible = abs(dual_violation_value) <= dual_feasibility_margin
+            far_from_feasible = dual_violation_value > dual_far_violation_threshold
+
+            if near_feasible:
+                dual_lr_scale = dual_near_feasible_factor
+            elif far_from_feasible:
+                dual_lr_scale = dual_far_feasible_factor
+            else:
+                dual_lr_scale = 1.0
+
+            for group in opt_dual.param_groups:
+                group['lr'] = dual_base_lr * dual_lr_scale
+
             loss_dual.backward()
             opt_dual.step()
+
+            if hasattr(loss_wrapper, 'pre_lambda'):
+                loss_wrapper.pre_lambda.data.clamp_(min=0.0)
 
         # ==========================================
         # 4. Validation & Early Stopping
@@ -159,6 +180,8 @@ def train_agent(
                 best_model_state = copy.deepcopy(sim.state_dict())
                 if "cvar" in mode and hasattr(loss_wrapper, 'tau'):
                     best_tau = loss_wrapper.tau.item()
+                if "lagrangian" in mode and hasattr(loss_wrapper, 'pre_lambda'):
+                    best_pre_lambda = loss_wrapper.pre_lambda.item()
                 if patience_limit is not None:
                     patience_counter = 0
             else:
@@ -176,6 +199,8 @@ def train_agent(
         sim.load_state_dict(best_model_state)
         if "cvar" in mode and best_tau is not None:
             loss_wrapper.tau.data = torch.tensor(best_tau, device=config.device)
+        if "lagrangian" in mode and best_pre_lambda is not None and hasattr(loss_wrapper, 'pre_lambda'):
+            loss_wrapper.pre_lambda.data = torch.tensor(best_pre_lambda, device=config.device)
         print(f"\nRestored best model (Metric: {best_val_metric:.4f}).")
 
     with torch.no_grad():

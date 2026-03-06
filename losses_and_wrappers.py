@@ -109,6 +109,12 @@ class PBLoss(nn.Module):
             exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
             cost_obs = self.lambda_obs * torch.exp(exponent_obs).sum(dim=(2, 3)).mean(dim=1)
 
+        elif self.coll_mode == 'rbf_max':
+            exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
+            rbf_obs = torch.exp(exponent_obs)
+            max_rbf_over_time = rbf_obs.amax(dim=1)  # shape: [batch, n_agents, n_obs]
+            cost_obs = self.lambda_obs * max_rbf_over_time.sum(dim=(1, 2))
+
         elif self.coll_mode == 'shifted_rbf':
             exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
             raw_rbf = torch.exp(exponent_obs)
@@ -146,6 +152,21 @@ class PBLoss(nn.Module):
             # You could return this for logging, but do NOT minimize this directly!
             cost_obs = min_dist_to_center.mean(dim=(1, 2))  # Just aggregating for output
 
+        elif self.coll_mode == 'signed_distance':
+            eps = 1e-12
+            rho = torch.linalg.norm(diff_obs / (self.obs_radii_safe + eps), dim=-1)
+            rho_safe = torch.clamp(rho, min=eps)
+            border_point = self.mu + diff_obs / rho_safe.unsqueeze(-1)
+
+            unsigned_dist = torch.linalg.norm(pos.unsqueeze(3) - border_point, dim=-1)
+            signed_dist = torch.where(rho < 1.0, unsigned_dist, -unsigned_dist)
+
+            min_safe_radius = self.obs_radii_safe.min(dim=-1).values.expand_as(signed_dist)
+            signed_dist = torch.where(rho < 1e-9, min_safe_radius, signed_dist)
+
+            max_signed_dist_over_traj = signed_dist.amax(dim=(1, 2, 3))
+            cost_obs = self.lambda_obs * max_signed_dist_over_traj
+
         else:
             raise ValueError(f"Unknown collision mode: {self.coll_mode}")
 
@@ -176,6 +197,13 @@ class PBLoss(nn.Module):
                 exponent_agents = -0.5 * (dist_agents_masked ** 2) / var_agents
                 rbf_agents = torch.exp(exponent_agents) * (1.0 - eye)
                 cost_agents = lambda_agent * rbf_agents.sum(dim=(2, 3)).mean(dim=1) / 2.0
+
+            elif self.coll_mode == 'rbf_max':
+                var_agents = (agent_margin / 2.0) ** 2
+                exponent_agents = -0.5 * (dist_agents_masked ** 2) / var_agents
+                rbf_agents = torch.exp(exponent_agents) * (1.0 - eye)
+                max_rbf_agents_over_time = rbf_agents.amax(dim=1)  # shape: [batch, n_agents, n_agents]
+                cost_agents = lambda_agent * max_rbf_agents_over_time.sum(dim=(1, 2)) / 2.0
 
             elif self.coll_mode == 'shifted_rbf':
                 var_agents = (agent_margin / 2.0) ** 2
@@ -321,7 +349,7 @@ class SplitCVaRLossWrapper(nn.Module):
 
 
 class LagrangianCVaRLossWrapper(nn.Module):
-    def __init__(self, alpha, tau_safe_bar, metric, tau_init=0.0, lambda_init=1.0):
+    def __init__(self, alpha, tau_safe_bar, metric, tau_init=0.0, lambda_init=1e-2):
         super().__init__()
         self.alpha = alpha
         self.tau_safe_bar = tau_safe_bar
@@ -331,8 +359,8 @@ class LagrangianCVaRLossWrapper(nn.Module):
         self.tau = nn.Parameter(torch.tensor(tau_init))
 
         # Dual parameter (Maximized).
-        # We optimize a raw value and apply softplus to guarantee lambda >= 0
-        self.pre_lambda = nn.Parameter(torch.tensor(lambda_init))
+        # This parameter is projected to lambda >= 0 by clamping after dual optimizer steps.
+        self.pre_lambda = nn.Parameter(torch.tensor(max(lambda_init, 0.0)))
 
     def forward(self, traj_x, traj_u):
         """
@@ -364,22 +392,22 @@ class LagrangianCVaRLossWrapper(nn.Module):
         constraint_violation = cvar_coll - self.tau_safe_bar
 
         # 4. Lagrangian Formulation
-        lambda_dual = F.softplus(self.pre_lambda)
+        lambda_dual = self.pre_lambda
         lagrangian = expected_perf + (lambda_dual * constraint_violation)
 
         return lagrangian, expected_perf, cvar_coll, lambda_dual, constraint_violation
 
 
 class LagrangianERMLossWrapper(nn.Module):
-    def __init__(self, alpha, tau_safe_bar, metric, lambda_init=1.0):
+    def __init__(self, alpha, tau_safe_bar, metric, lambda_init=0.0):
         super().__init__()
         self.alpha = alpha
         self.tau_safe_bar = tau_safe_bar
         self.metric = metric
 
         # Dual parameter (Maximized).
-        # We optimize a raw value and apply softplus to guarantee lambda >= 0
-        self.pre_lambda = nn.Parameter(torch.tensor(lambda_init))
+        # This parameter is projected to lambda >= 0 by clamping after dual optimizer steps.
+        self.pre_lambda = nn.Parameter(torch.tensor(max(lambda_init, 0.0)))
 
     def forward(self, traj_x, traj_u):
         """
@@ -410,7 +438,7 @@ class LagrangianERMLossWrapper(nn.Module):
         constraint_violation = expected_coll - self.tau_safe_bar
 
         # 4. Lagrangian Formulation
-        lambda_dual = F.softplus(self.pre_lambda)
+        lambda_dual = self.pre_lambda
         lagrangian = expected_perf + (lambda_dual * constraint_violation)
 
         return lagrangian, expected_perf, expected_coll, lambda_dual, constraint_violation

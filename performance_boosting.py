@@ -521,6 +521,12 @@ class PBLossnew(nn.Module):
             exponent = -0.5 * torch.sum(((pos.unsqueeze(3) - self.mu) ** 2) / self.variance, dim=-1)
             return self.lambda_obs * torch.exp(exponent).sum(dim=(2, 3)).mean(dim=1)
 
+        if mode == 'rbf_max':
+            exponent = -0.5 * torch.sum(((pos.unsqueeze(3) - self.mu) ** 2) / self.variance, dim=-1)
+            rbf = torch.exp(exponent)
+            max_rbf_over_time = rbf.amax(dim=1)  # shape: [batch, n_agents, n_obs]
+            return self.lambda_obs * max_rbf_over_time.sum(dim=(1, 2))
+
         # For all distance-based methods
         diff = pos.unsqueeze(3) - self.mu
         distances = torch.norm(diff, p=2, dim=-1)  # [B, H, Agents, Obs]
@@ -539,6 +545,33 @@ class PBLossnew(nn.Module):
         elif mode == 'barrier':
             # Matches your old code: Mean over time AND obstacles
             return self.lambda_obs * (violation ** 2).view(batch_size, -1).mean(dim=1)
+
+        elif mode == 'signed_distance':
+            eps = 1e-12
+
+            if isinstance(self.r_safe, torch.Tensor):
+                r_safe_tensor = self.r_safe.to(pos.device)
+                if r_safe_tensor.dim() == 4:
+                    r_safe_xy = r_safe_tensor.unsqueeze(-1).repeat(1, 1, 1, 1, 2)
+                elif r_safe_tensor.dim() == 5:
+                    r_safe_xy = r_safe_tensor
+                else:
+                    raise ValueError(f"Unsupported r_safe tensor shape: {tuple(r_safe_tensor.shape)}")
+            else:
+                r_safe_xy = torch.tensor(self.r_safe, dtype=pos.dtype, device=pos.device).view(1, 1, 1, 1, 1).expand(1, 1, 1, self.mu.shape[-2], 2)
+
+            rho = torch.linalg.norm(diff / (r_safe_xy + eps), dim=-1)
+            rho_safe = torch.clamp(rho, min=eps)
+            border_point = self.mu + diff / rho_safe.unsqueeze(-1)
+
+            unsigned_dist = torch.linalg.norm(pos.unsqueeze(3) - border_point, dim=-1)
+            signed_dist = torch.where(rho < 1.0, unsigned_dist, -unsigned_dist)
+
+            min_safe_radius = r_safe_xy.min(dim=-1).values.expand_as(signed_dist)
+            signed_dist = torch.where(rho < 1e-9, min_safe_radius, signed_dist)
+
+            max_signed_dist_over_traj = signed_dist.amax(dim=(1, 2, 3))
+            return self.lambda_obs * max_signed_dist_over_traj
 
         else:
             raise ValueError(f"Unknown collision mode: {mode}")
