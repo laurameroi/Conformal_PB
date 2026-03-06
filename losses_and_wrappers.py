@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class PBLoss(nn.Module):
     """
     Base Performance Boosting Loss function.
@@ -233,6 +234,7 @@ class PBLoss(nn.Module):
 
         return total_cost, cost_x, cost_u, cost_coll
 
+
 class ERMWrapper(nn.Module):
     def __init__(self, metric):
         super().__init__()
@@ -280,6 +282,7 @@ class CVaRLossWrapper(nn.Module):
         # Return the optimized CVaR loss, plus the standard averages for logging
         return cvar_loss, cost_x.mean(), cost_u.mean(), cvar_loss
 
+
 class SplitCVaRLossWrapper(nn.Module):
     def __init__(self, alpha, lambda_decoupling, metric, tau_init=0.0):
         super().__init__()
@@ -312,9 +315,10 @@ class SplitCVaRLossWrapper(nn.Module):
         cvar_coll = self.tau + (1.0 / self.alpha) * torch.mean(excess_coll)
 
         # 3. Total Loss
-        total_loss = expected_perf + (self.lambda_decoupling * cvar_coll)
+        total_loss = expected_perf + self.lambda_decoupling * cvar_coll
 
         return total_loss, cost_x.mean(), cost_u.mean(), cvar_coll
+
 
 class LagrangianCVaRLossWrapper(nn.Module):
     def __init__(self, alpha, tau_safe_bar, metric, tau_init=0.0, lambda_init=1.0):
@@ -365,6 +369,7 @@ class LagrangianCVaRLossWrapper(nn.Module):
 
         return lagrangian, expected_perf, cvar_coll, lambda_dual, constraint_violation
 
+
 class LagrangianERMLossWrapper(nn.Module):
     def __init__(self, alpha, tau_safe_bar, metric, lambda_init=1.0):
         super().__init__()
@@ -410,6 +415,7 @@ class LagrangianERMLossWrapper(nn.Module):
 
         return lagrangian, expected_perf, expected_coll, lambda_dual, constraint_violation
 
+
 class SoftmaxWorstCaseLossWrapper(nn.Module):
     def __init__(self, beta, metric):
         """
@@ -443,6 +449,7 @@ class SoftmaxWorstCaseLossWrapper(nn.Module):
 
         # Return the optimized Softmax loss, plus the standard averages for logging
         return softmax_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
+
 
 class PinballLossWrapper(nn.Module):
     def __init__(self, alpha, metric, tau_init=0.0):

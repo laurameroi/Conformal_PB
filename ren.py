@@ -122,10 +122,6 @@ class ContractiveREN(nn.Module):
         Return:
             y_out (torch.Tensor): Output with (batch_size, 1, self.dim_out).
         """
-        # REMOVED update of non-trainable model params for one step
-        # must be moved inside the PB controller
-        #self._update_model_param()
-
         batch_size = u_in.shape[0]
 
         w = torch.zeros(batch_size, 1, self.dim_nl, device=u_in.device)
