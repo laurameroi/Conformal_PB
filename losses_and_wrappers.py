@@ -47,7 +47,7 @@ class PBLoss(nn.Module):
                 # If it's a flat number like [0.3, [0.1, 0.5]]
                 if isinstance(r, (int, float)):
                     processed_radii.append([float(r), float(r)])
-                # If it's a 1-element list like [[0.3], [0.1, 0.5]] (Your exact case)
+                # If it's a 1-element list like [[0.3], [0.1, 0.5]]
                 elif isinstance(r, list) and len(r) == 1:
                     processed_radii.append([float(r[0]), float(r[0])])
                 # If it's a 2-element list for an ellipse
@@ -100,9 +100,22 @@ class PBLoss(nn.Module):
         # If scaled_dist <= 1.0, the agent is inside the obstacle's safe boundary.
         scaled_diff_obs = diff_obs / self.obs_radii_safe
         scaled_dist_obs = torch.norm(scaled_diff_obs, p=2, dim=-1)
+        # 1. Get the true physical distance to the center (in meters)
+        true_dist = torch.norm(diff_obs, p=2, dim=-1)
 
-        avg_radii = self.obs_radii_safe.mean(dim=-1)
-        violation_obs = torch.relu(1.0 - scaled_dist_obs) * avg_radii
+        # 2. Prevent division by zero if the agent is EXACTLY at the center
+        safe_scaled_dist = torch.clamp(scaled_dist_obs, min=1e-6)
+
+        # 3. Calculate the exact physical radius of the ellipsoid in the
+        #    specific direction the agent is currently located.
+        #    (If scaled_dist is 0.5 and true_dist is 2m, the boundary is at 4m)
+        directional_radius = true_dist / safe_scaled_dist
+
+        # 4. The violation is simply the boundary distance minus true distance
+        violation_obs = torch.relu(directional_radius - true_dist)
+
+        # avg_radii = self.obs_radii_safe.mean(dim=-1)
+        # violation_obs = torch.relu(1.0 - scaled_dist_obs) * avg_radii
 
         if self.coll_mode == 'rbf':
             exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
